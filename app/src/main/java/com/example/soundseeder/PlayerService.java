@@ -9,12 +9,14 @@ import android.net.Uri;
 import android.os.IBinder;
 import android.util.Log;
 
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -24,42 +26,32 @@ import android.media.MediaExtractor;
 public class PlayerService extends Service {
     private static final int PORT = 12345;
     private static final String TAG = "PlayerService";
-    private AudioTrack audioTrack;
-    //    private ArrayBlockingQueue<byte[]> audioQueue;
-    private ArrayBlockingQueue<AudioChunk> audioChunkQueue;
+    private static final int SAMPLE_RATE = 44100;
+    private static final int CHUNK_SIZE = 4096 / 2;
+    private static final int QUEUE_CAPACITY = 10;
+    private static final int BYTES_PER_SECOND = SAMPLE_RATE * 2 * 2;
+    private static final long SEND_INTERVAL_MS = 1;
 
+    private AudioTrack audioTrack;
+    int minBufferdSize = 0;
+    private ArrayBlockingQueue<byte[]> audioQueue;
     private Thread playbackThread;
     private Thread streamingThread;
     private Thread serverThread;
-    private AtomicBoolean isPlaying = new AtomicBoolean(false);
+    private final AtomicBoolean isPlaying = new AtomicBoolean(false);
     private ServerSocket serverSocket;
     private final List<Socket> clients = new ArrayList<>();
     private long playbackPosition = 0;
     private long duration = 0;
     private MediaExtractor extractor;
 
-    private final Object bufferLock = new Object();
-    private long bufferedDurationMs = 0;
-    private static final long MAX_BUFFER_DURATION_MS = 1000;
-
-    private static class AudioChunk {
-        byte[] data;
-        long durationMs;
-
-        AudioChunk(byte[] data, long durationMs) {
-            this.data = data;
-            this.durationMs = durationMs;
-        }
-    }
-
     @Override
     public void onCreate() {
         super.onCreate();
-//        audioQueue = new ArrayBlockingQueue<>(43);
-        audioChunkQueue = new ArrayBlockingQueue<>(128);
+        audioQueue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
         initializeAudioTrack();
         startServer();
-        Log.d(TAG, "Service created");
+        Log.d(TAG, "Service created with queue capacity: " + QUEUE_CAPACITY);
     }
 
     @Override
@@ -70,6 +62,8 @@ public class PlayerService extends Service {
                     String uriString = intent.getStringExtra("SONG_URI");
                     if (uriString != null) {
                         playSong(Uri.parse(uriString));
+                    } else {
+                        Log.e(TAG, "No URI provided for PLAY action");
                     }
                     break;
                 case "TOGGLE_PAUSE":
@@ -85,22 +79,23 @@ public class PlayerService extends Service {
     }
 
     private void initializeAudioTrack() {
-        int sampleRate = 44100;
+        int sampleRate = SAMPLE_RATE;
         int channelConfig = AudioFormat.CHANNEL_OUT_STEREO;
         int audioFormat = AudioFormat.ENCODING_PCM_16BIT;
-        int bufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, audioFormat) * 2; // بافر بزرگ‌تر
-        audioTrack = new AudioTrack.Builder()
-                .setAudioAttributes(new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build())
-                .setAudioFormat(new AudioFormat.Builder()
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(channelConfig)
-                        .setEncoding(audioFormat)
-                        .build())
-                .setBufferSizeInBytes(bufferSize)
-                .build();
+        int bufferSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, audioFormat) * 2;
+
+        minBufferdSize = AudioTrack.getMinBufferSize(sampleRate, 4, 2);
+
+        System.out.println("minBuffer: " + minBufferdSize);
+
+
+        audioTrack = new AudioTrack(3, sampleRate,
+                4, 2, minBufferdSize
+                , 1);
+
+
+        audioTrack.setStereoVolume(0.0f, 0.0f);
+
         audioTrack.setPlaybackPositionUpdateListener(new AudioTrack.OnPlaybackPositionUpdateListener() {
             @Override
             public void onMarkerReached(AudioTrack track) {
@@ -112,36 +107,50 @@ public class PlayerService extends Service {
                 Log.d(TAG, "Playback position: " + playbackPosition + "ms");
             }
         });
-        audioTrack.setPositionNotificationPeriod(sampleRate / 10); // آپدیت هر 100ms
+        audioTrack.setPositionNotificationPeriod(sampleRate / 10);
         Log.d(TAG, "AudioTrack initialized with buffer size: " + bufferSize);
     }
 
     private void playSong(Uri uri) {
         stopPlayback();
+        if (uri == null) {
+            Log.e(TAG, "URI is null, cannot play song");
+            return;
+        }
+        Log.d(TAG, "Playing song with URI: " + uri.toString());
         isPlaying.set(true);
 
         playbackThread = new Thread(() -> {
             try {
                 extractor = new MediaExtractor();
-                extractor.setDataSource(this, uri, null);
+                try {
+                    extractor.setDataSource(this, uri, null);
+                } catch (IOException e) {
+                    Log.e(TAG, "Failed to set data source for URI: " + uri, e);
+                    isPlaying.set(false);
+                    return;
+                }
+
                 int trackCount = extractor.getTrackCount();
+                if (trackCount == 0) {
+                    Log.e(TAG, "No tracks found in file: " + uri);
+                    isPlaying.set(false);
+                    return;
+                }
+
                 Log.d(TAG, "Track count: " + trackCount);
-                int sampleRate = 44100;
-                int bytesPerFrame = 4;
                 for (int i = 0; i < trackCount; i++) {
                     android.media.MediaFormat format = extractor.getTrackFormat(i);
-                    if (format.getString(android.media.MediaFormat.KEY_MIME).startsWith("audio/")) {
+                    String mime = format.getString(android.media.MediaFormat.KEY_MIME);
+                    if (mime != null && mime.startsWith("audio/")) {
                         extractor.selectTrack(i);
                         duration = format.getLong(android.media.MediaFormat.KEY_DURATION) / 1000;
                         Log.d(TAG, "Selected audio track, duration: " + duration + "ms");
-                        if (format.containsKey(android.media.MediaFormat.KEY_SAMPLE_RATE)) {
-                            sampleRate = format.getInteger(android.media.MediaFormat.KEY_SAMPLE_RATE);
-                        }
                         break;
                     }
                 }
 
-                ByteBuffer buffer = ByteBuffer.allocate(4096);
+                ByteBuffer buffer = ByteBuffer.allocate(CHUNK_SIZE);
                 while (isPlaying.get()) {
                     int size = extractor.readSampleData(buffer, 0);
                     if (size < 0) {
@@ -151,85 +160,136 @@ public class PlayerService extends Service {
                     byte[] data = new byte[size];
                     buffer.rewind();
                     buffer.get(data);
-                    long chunkDurationMs = (long) (((double) size / (sampleRate * bytesPerFrame)) * 1000);
-
-//                    audioQueue.put(data);
-
-                    synchronized (bufferLock) {
-                        while (bufferedDurationMs + chunkDurationMs > MAX_BUFFER_DURATION_MS) {
-                            bufferLock.wait();
-                        }
-                        audioChunkQueue.put(new AudioChunk(data, chunkDurationMs));
-                        bufferedDurationMs += chunkDurationMs;
+                    while (!audioQueue.offer(data, 100, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                        Log.w(TAG, "Queue full, waiting...");
                     }
-
-                   /* if (!audioQueue.offer(data)) {
-                        Log.w(TAG, "Queue full, dropping data");
-                        audioQueue.poll();
-                        audioQueue.offer(data);
-                    }*/
                     Log.d(TAG, "Added " + size + " bytes to queue");
                     extractor.advance();
                 }
-                extractor.release();
-                extractor = null;
-            } catch (IOException | InterruptedException e) {
-                Log.e(TAG, "Error extracting audio", e);
+            } catch (Exception e) {
+                Log.e(TAG, "Error in playback thread", e);
+            } finally {
+                if (extractor != null) {
+                    extractor.release();
+                    extractor = null;
+                }
+                isPlaying.set(false);
             }
         });
         playbackThread.start();
 
         streamingThread = new Thread(() -> {
-            while (isPlaying.get() || !audioChunkQueue.isEmpty()) {
+            long lastSendTime = System.currentTimeMillis();
+            byte[] accumulatedData = new byte[BYTES_PER_SECOND];
+            int accumulatedSize = 0;
+
+            while (isPlaying.get() || !audioQueue.isEmpty()) {
                 try {
-                    AudioChunk chunk = audioChunkQueue.take();
-                    Log.d(TAG, "Writing " + chunk.data.length + " bytes to AudioTrack");
-                    int written = audioTrack.write(chunk.data, 0, chunk.data.length);
+                    byte[] data = audioQueue.take();
+                    byte[] byteArray = minBufferdSize <= 0 ? ByteArrayPool.getByteArray(32768) : ByteArrayPool.getByteArray(minBufferdSize * 2);
+                    int written = audioTrack.write(byteArray, 0, data.length);
                     if (written < 0) {
                         Log.e(TAG, "AudioTrack write failed: " + written);
+                    } else {
+                        Log.d(TAG, "Wrote " + written + " bytes to AudioTrack");
                     }
-                    synchronized (bufferLock) {
-                        bufferedDurationMs -= chunk.durationMs;
-                        if (bufferedDurationMs < 0) {
-                            bufferedDurationMs = 0;
-                        }
-                        bufferLock.notifyAll();
-                    }
+
                     synchronized (clients) {
                         for (Socket client : new ArrayList<>(clients)) {
                             if (!client.isClosed()) {
                                 try {
-                                    OutputStream out = client.getOutputStream();
-                                    out.write(chunk.data);
-                                    out.flush();
+                                    BufferedOutputStream bufferedOutputStream = new BufferedOutputStream(client.getOutputStream());
+                                    bufferedOutputStream.write(data);
+                                    bufferedOutputStream.flush();
+                                    Log.d(TAG, "Sent " + byteArray.length + " bytes to client");
                                 } catch (IOException e) {
                                     Log.e(TAG, "Client disconnected", e);
-                                    client.close();
+                                    try {
+                                        client.close();
+                                    } catch (IOException ignored) {
+                                    }
                                     clients.remove(client);
                                 }
                             }
                         }
                     }
-                } catch (InterruptedException | IOException e) {
+
+                } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     Log.d(TAG, "Streaming thread interrupted");
                     break;
                 }
             }
+
         });
         streamingThread.start();
 
+
         audioTrack.play();
+        audioTrack.flush();
         Log.d(TAG, "AudioTrack started");
+    }
+
+    private void sendAccumulatedData(byte[] sendData) {
+        Log.d(TAG, "Sending " + sendData.length + " bytes to clients");
+        synchronized (clients) {
+            for (Socket client : new ArrayList<>(clients)) {
+                if (!client.isClosed()) {
+                    try {
+                        BufferedOutputStream bufferedOutputStream = new BufferedOutputStream(client.getOutputStream());
+                        byte[] f37192z = {82, 73, 70, 70};
+                        bufferedOutputStream.write(f37192z);
+                        bufferedOutputStream.flush();
+                        Log.d(TAG, "Sent " + sendData.length + " bytes to client");
+                    } catch (IOException e) {
+                        Log.e(TAG, "Client disconnected", e);
+                        try {
+                            client.close();
+                        } catch (IOException ignored) {
+                        }
+                        clients.remove(client);
+                    }
+                }
+            }
+        }
+    }
+
+    private void sendAccumulatedData(byte[] accumulatedData, int size) {
+//        System.out.println("hey data must be send: " + accumulatedData );
+        System.out.println("size is : " + size);
+        byte[] sendData = new byte[size];
+        System.arraycopy(accumulatedData, 0, sendData, 0, size);
+        synchronized (clients) {
+            for (Socket client : new ArrayList<>(clients)) {
+                if (!client.isClosed()) {
+                    try {
+                        BufferedOutputStream bufferedOutputStream = new BufferedOutputStream(client.getOutputStream());
+                        bufferedOutputStream.write(sendData);
+                        bufferedOutputStream.flush();
+                        Log.d(TAG, "Sent " + sendData.length + " bytes to client");
+                    } catch (IOException e) {
+                        Log.e(TAG, "Client disconnected", e);
+                        try {
+                            client.close();
+                        } catch (IOException ignored) {
+                        }
+                        clients.remove(client);
+                    }
+                }
+            }
+        }
     }
 
     private void togglePause() {
         if (audioTrack.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
             audioTrack.pause();
+            audioQueue.clear();
             Log.d(TAG, "Paused");
+            //notifyClients("PAUSE");
         } else {
             audioTrack.play();
             Log.d(TAG, "Resumed");
+            //notifyClients("RESUME");
         }
     }
 
@@ -237,7 +297,7 @@ public class PlayerService extends Service {
         synchronized (audioTrack) {
             audioTrack.pause();
             audioTrack.flush();
-            audioChunkQueue.clear();
+            audioQueue.clear();
             if (extractor != null) {
                 extractor.seekTo(positionMs * 1000, MediaExtractor.SEEK_TO_CLOSEST_SYNC);
                 playbackPosition = positionMs;
@@ -246,15 +306,27 @@ public class PlayerService extends Service {
             if (isPlaying.get()) {
                 audioTrack.play();
             }
+            //notifyClients("SEEK:" + positionMs);
         }
+    }
+
+    private void notifyClients(String command) {
         synchronized (clients) {
-            for (Socket client : clients) {
-                try {
-                    OutputStream out = client.getOutputStream();
-                    out.write(("SEEK:" + positionMs).getBytes());
-                    out.flush();
-                } catch (IOException e) {
-                    Log.e(TAG, "Error sending seek to client", e);
+            for (Socket client : new ArrayList<>(clients)) {
+                if (!client.isClosed()) {
+                    try {
+                        OutputStream out = client.getOutputStream();
+                        out.write(command.getBytes());
+                        out.flush();
+                        Log.d(TAG, "Sent command to client: " + command);
+                    } catch (IOException e) {
+                        Log.e(TAG, "Error sending command to client", e);
+                        try {
+                            client.close();
+                        } catch (IOException ignored) {
+                        }
+                        clients.remove(client);
+                    }
                 }
             }
         }
@@ -266,10 +338,11 @@ public class PlayerService extends Service {
             audioTrack.stop();
             audioTrack.flush();
         }
-        audioChunkQueue.clear();
+        audioQueue.clear();
         if (playbackThread != null) playbackThread.interrupt();
         if (streamingThread != null) streamingThread.interrupt();
         Log.d(TAG, "Playback stopped");
+        //notifyClients("STOP");
     }
 
     private void startServer() {
@@ -279,6 +352,10 @@ public class PlayerService extends Service {
                 Log.d(TAG, "Server started on port " + PORT);
                 while (true) {
                     Socket client = serverSocket.accept();
+                    client.setSendBufferSize(65536);
+                    client.setTcpNoDelay(true);
+                    client.setSoTimeout(1000);
+
                     synchronized (clients) {
                         clients.add(client);
                         Log.i(TAG, "Client connected: " + client.getInetAddress());
@@ -299,15 +376,14 @@ public class PlayerService extends Service {
             for (Socket client : clients) {
                 try {
                     client.close();
-                } catch (IOException ignored) {
-
+                } catch (IOException e) {
                 }
             }
             clients.clear();
         }
         try {
             if (serverSocket != null) serverSocket.close();
-        } catch (IOException ignored) {
+        } catch (IOException e) {
         }
         if (serverThread != null) serverThread.interrupt();
         Log.d(TAG, "Service destroyed");
