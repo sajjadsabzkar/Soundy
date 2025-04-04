@@ -2,6 +2,7 @@ package com.example.soundseeder;
 
 import android.app.Service;
 import android.content.Intent;
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.media.MediaCodec;
@@ -13,14 +14,18 @@ import android.util.Log;
 
 import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import android.media.MediaExtractor;
 
 public class PlayerService extends Service {
     private static final int PORT = 12345;
@@ -182,7 +187,6 @@ public class PlayerService extends Service {
                 isPlaying.set(false);
             }
         });
-
         playbackThread.start();
 
        /* streamingThread = new Thread(() -> {

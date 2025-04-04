@@ -25,8 +25,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import kotlin.jvm.java
+import androidx.core.net.toUri
 
-class MainActivity : ComponentActivity(){
+class MainActivity : ComponentActivity() {
     private val songs = mutableStateListOf<Song>()
     private var currentSongIndex by mutableStateOf(-1)
     private var playbackPosition by mutableStateOf(0f)
@@ -35,13 +36,21 @@ class MainActivity : ComponentActivity(){
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), 1)
+        if (ActivityCompat.checkSelfPermission(
+                this,
+                Manifest.permission.READ_EXTERNAL_STORAGE
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE),
+                1
+            )
             return
         }
 
         loadSongs()
-        startService(Intent(this, PlayerService::class.java))
+        startService(Intent(this, MusicPlayerService::class.java))
 
         setContent {
             MaterialTheme {
@@ -69,27 +78,35 @@ class MainActivity : ComponentActivity(){
 
     private fun loadSongs() {
         val projection = arrayOf(MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.DATA)
-        val cursor = contentResolver.query(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, projection, null, null, null)
+        val cursor = contentResolver.query(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            projection,
+            null,
+            null,
+            null
+        )
         cursor?.use {
             while (it.moveToNext()) {
                 val title = it.getString(0)
                 val path = it.getString(1)
-                songs.add(Song(title, Uri.parse(path)))
+                val song = Song(path.toUri())
+                song.title = title;
+                songs.add(song)
             }
         }
     }
 
     private fun playSong(index: Int) {
-        val intent = Intent(this, PlayerService::class.java).apply {
+        val intent = Intent(this, MusicPlayerService::class.java).apply {
             action = "PLAY"
-            putExtra("SONG_URI", songs[index].getUri().toString())
+            putExtra("SONG_URI", songs[index].uri.toString())
             putExtra("SONG_INDEX", index)
         }
         startService(intent)
     }
 
     private fun togglePause() {
-        startService(Intent(this, PlayerService::class.java).apply { action = "TOGGLE_PAUSE" })
+        startService(Intent(this, MusicPlayerService::class.java).apply { action = "TOGGLE_PAUSE" })
     }
 
     private fun playNext() {
@@ -105,7 +122,7 @@ class MainActivity : ComponentActivity(){
     }
 
     private fun seekTo(position: Float) {
-        val intent = Intent(this, PlayerService::class.java).apply {
+        val intent = Intent(this, MusicPlayerService::class.java).apply {
             action = "SEEK"
             putExtra("POSITION", position)
         }
@@ -126,7 +143,11 @@ fun PlayerUI(
     onSeek: (Float) -> Unit,
     onPositionUpdate: (Float, Float) -> Unit
 ) {
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
         LazyColumn(modifier = Modifier.weight(1f)) {
             itemsIndexed(songs) { index, song ->
                 Text(
